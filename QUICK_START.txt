@@ -1,0 +1,9 @@
+G30 CONTROL - SNABBSTART
+
+1. Flasha firmware/SimpleVescDisplay_G30_UART_Throttle_V19_ANDROID_APP.ino
+2. Ladda upp hela projektmappen till ett GitHub-repo.
+3. GitHub -> Actions -> Build G30 Control APK -> Run workflow.
+4. Ladda ner artifacten G30-Control-APK.
+5. Packa upp och installera app-debug.apk på Android.
+6. Starta scootern -> öppna appen -> ANSLUT -> välj/tillåt G30-NAV.
+7. Stå still med släppt gas när du tillämpar eller sparar.
