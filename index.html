@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>G30 OSM Navigation</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body { height:100%; margin:0; font-family:system-ui,-apple-system,sans-serif; background:#0b1115; color:#eef6f8; }
+    #map { height:62vh; }
+    .panel { padding:12px; display:grid; gap:10px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; }
+    button { border:0; border-radius:12px; padding:12px 14px; font-size:16px; font-weight:650; }
+    #ble { background:#1bc7ad; color:#052520; }
+    #locate { background:#24343d; color:#fff; }
+    #clear { background:#3c2a2a; color:#fff; }
+    .status { background:#121d23; border:1px solid #24363f; border-radius:12px; padding:10px 12px; }
+    .muted { color:#9fb0b8; font-size:13px; }
+    strong { color:#fff; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <div class="row">
+      <button id="ble">Anslut G30-NAV</button>
+      <button id="locate">Centrera på mig</button>
+      <button id="clear">Rensa rutt</button>
+    </div>
+    <div class="status">
+      <div><strong id="state">Inte ansluten</strong></div>
+      <div id="instruction">Tryck på kartan för att välja destination.</div>
+      <div class="muted">OpenStreetMap på mobilen. Rutt + svänginformation skickas med Bluetooth till ESP32-skärmen.</div>
+    </div>
+  </div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+
+let rxChar = null;
+let bleDevice = null;
+let current = null;
+let destination = null;
+let route = null;
+let routeLine = null;
+let destMarker = null;
+let meMarker = null;
+let watchId = null;
+let stepIndex = 0;
+let lastRouteRequest = 0;
+let lastBleSend = 0;
+
+const stateEl = document.getElementById('state');
+const instrEl = document.getElementById('instruction');
+
+const map = L.map('map', { zoomControl:true }).setView([59.3293, 18.0686], 13);
+
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+function rad(v) { return v * Math.PI / 180; }
+
+function distanceM(a, b) {
+  const R = 6371000;
+  const p1 = rad(a.lat), p2 = rad(b.lat);
+  const dp = rad(b.lat - a.lat);
+  const dl = rad(b.lng - a.lng);
+  const s = Math.sin(dp/2)**2 +
+            Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
+  return 2*R*Math.atan2(Math.sqrt(s), Math.sqrt(1-s));
+}
+
+function turnCode(step) {
+  if (!step || !step.maneuver) return 'S';
+  const type = step.maneuver.type || '';
+  const mod = step.maneuver.modifier || '';
+
+  if (type === 'arrive') return 'ARRIVE';
+  if (type === 'uturn' || mod === 'uturn') return 'U';
+  if (mod.includes('sharp left')) return 'L';
+  if (mod.includes('slight left')) return 'SL';
+  if (mod.includes('left')) return 'L';
+  if (mod.includes('sharp right')) return 'R';
+  if (mod.includes('slight right')) return 'SR';
+  if (mod.includes('right')) return 'R';
+  return 'S';
+}
+
+async function writeBle(text) {
+  if (!rxChar) return;
+  const bytes = new TextEncoder().encode(text);
+  try {
+    // Firmware exposes a normal WRITE characteristic for broad compatibility.
+    await rxChar.writeValue(bytes);
+  } catch (e) {
+    console.warn('BLE write failed', e);
+  }
+}
+
+document.getElementById('ble').onclick = async () => {
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'G30-NAV' }],
+      optionalServices: [SERVICE]
+    });
+
+    bleDevice.addEventListener('gattserverdisconnected', () => {
+      rxChar = null;
+      stateEl.textContent = 'Bluetooth frånkopplad';
+    });
+
+    const server = await bleDevice.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE);
+    rxChar = await service.getCharacteristic(RX);
+
+    stateEl.textContent = 'Bluetooth ansluten till G30-NAV';
+    startGps();
+  } catch (e) {
+    stateEl.textContent = 'Bluetooth-fel: ' + e.message;
+  }
+};
+
+document.getElementById('locate').onclick = () => {
+  if (current) map.setView([current.lat, current.lng], 16);
+  startGps();
+};
+
+document.getElementById('clear').onclick = async () => {
+  destination = null;
+  route = null;
+  stepIndex = 0;
+  if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+  if (destMarker) { map.removeLayer(destMarker); destMarker = null; }
+  instrEl.textContent = 'Tryck på kartan för att välja destination.';
+  await writeBle('CLR');
+};
+
+map.on('click', async (e) => {
+  destination = { lat:e.latlng.lat, lng:e.latlng.lng };
+  if (destMarker) map.removeLayer(destMarker);
+  destMarker = L.marker(e.latlng).addTo(map);
+  await calculateRoute();
+});
+
+function startGps() {
+  if (watchId !== null) return;
+  if (!navigator.geolocation) {
+    stateEl.textContent = 'Telefonen saknar Geolocation API';
+    return;
+  }
+
+  watchId = navigator.geolocation.watchPosition(
+    async pos => {
+      current = {
+        lat: pos.coords.latitude,
+        lng: pos.coords.longitude,
+        heading: Number.isFinite(pos.coords.heading) ? pos.coords.heading : 0
+      };
+
+      if (!meMarker) {
+        meMarker = L.circleMarker([current.lat, current.lng], {
+          radius:7, color:'#fff', weight:2, fillColor:'#1bc7ad', fillOpacity:1
+        }).addTo(map);
+        map.setView([current.lat, current.lng], 16);
+      } else {
+        meMarker.setLatLng([current.lat, current.lng]);
+      }
+
+      if (destination && route) {
+        await updateNavigation();
+      } else if (destination && Date.now() - lastRouteRequest > 3000) {
+        await calculateRoute();
+      }
+    },
+    err => stateEl.textContent = 'GPS-fel: ' + err.message,
+    { enableHighAccuracy:true, maximumAge:500, timeout:10000 }
+  );
+}
+
+async function calculateRoute() {
+  if (!current || !destination) {
+    instrEl.textContent = 'Väntar på GPS-position...';
+    return;
+  }
+
+  lastRouteRequest = Date.now();
+
+  // Public OSRM demo endpoint. It uses OpenStreetMap-derived road data.
+  const url =
+    `https://router.project-osrm.org/route/v1/driving/` +
+    `${current.lng},${current.lat};${destination.lng},${destination.lat}` +
+    `?overview=full&steps=true&geometries=geojson`;
+
+  try {
+    const r = await fetch(url);
+    const data = await r.json();
+    if (!data.routes || !data.routes.length) throw new Error('Ingen rutt');
+
+    route = data.routes[0];
+    route.steps = route.legs.flatMap(l => l.steps || []);
+    stepIndex = 0;
+
+    if (routeLine) map.removeLayer(routeLine);
+    routeLine = L.geoJSON(route.geometry, {
+      style: { color:'#1bc7ad', weight:6, opacity:.9 }
+    }).addTo(map);
+
+    await updateNavigation();
+  } catch (e) {
+    instrEl.textContent = 'Ruttfel: ' + e.message;
+  }
+}
+
+function nextRelevantStep() {
+  if (!route || !route.steps || !route.steps.length) return null;
+
+  // Advance when we are close to the current maneuver.
+  while (stepIndex < route.steps.length - 1) {
+    const s = route.steps[stepIndex];
+    const loc = s.maneuver && s.maneuver.location;
+    if (!loc) { stepIndex++; continue; }
+
+    const d = distanceM(current, { lat:loc[1], lng:loc[0] });
+    if (d < 24) stepIndex++;
+    else break;
+  }
+
+  return route.steps[Math.min(stepIndex, route.steps.length - 1)];
+}
+
+function routePreviewPacket() {
+  if (!route || !route.geometry || !route.geometry.coordinates || !current) return '';
+
+  const coords = route.geometry.coordinates;
+  let nearest = 0;
+  let best = Infinity;
+
+  // Find nearest route coordinate.
+  for (let i=0; i<coords.length; i+=Math.max(1, Math.floor(coords.length/180))) {
+    const d = distanceM(current, {lat:coords[i][1], lng:coords[i][0]});
+    if (d < best) { best=d; nearest=i; }
+  }
+
+  // Show roughly the next 250-350 m, north-up.
+  const points = [];
+  const cosLat = Math.cos(rad(current.lat));
+  const stride = Math.max(1, Math.floor((coords.length - nearest) / 17));
+
+  for (let i=nearest; i<coords.length && points.length<18; i+=stride) {
+    const lon = coords[i][0], lat = coords[i][1];
+    const east = (lon - current.lng) * 111320 * cosLat;
+    const north = (lat - current.lat) * 110540;
+
+    // 5 m per normalized unit, rider around 50,68.
+    const x = Math.max(0, Math.min(100, Math.round(50 + east / 5)));
+    const y = Math.max(0, Math.min(100, Math.round(68 - north / 5)));
+    points.push(`${x},${y}`);
+  }
+
+  if (points.length < 2) return '';
+  return 'MAP|' + points.join(';');
+}
+
+async function updateNavigation() {
+  if (!current || !route) return;
+
+  const step = nextRelevantStep();
+  if (!step) return;
+
+  const loc = step.maneuver && step.maneuver.location;
+  const dist = loc
+    ? Math.round(distanceM(current, {lat:loc[1], lng:loc[0]}))
+    : Math.round(step.distance || 0);
+
+  const code = turnCode(step);
+  const road = (step.name || 'Unnamed road').replace(/[|\n\r]/g, ' ').slice(0, 30);
+  const bearing = Math.round(
+    Number.isFinite(current.heading) ? current.heading :
+    (step.maneuver && step.maneuver.bearing_before) || 0
+  );
+
+  // Remaining ETA approximation from current step onward.
+  let remainingSec = 0;
+  for (let i=stepIndex; i<route.steps.length; i++) {
+    remainingSec += route.steps[i].duration || 0;
+  }
+  const etaMin = Math.max(0, Math.round(remainingSec / 60));
+
+  instrEl.textContent =
+    `${code} • ${dist} m • ${road} • ETA ${etaMin} min`;
+
+  // Rate-limit BLE updates.
+  if (Date.now() - lastBleSend < 700) return;
+  lastBleSend = Date.now();
+
+  await writeBle(`NAV|${code}|${dist}|${road}|${bearing}|${etaMin}`);
+
+  const mapPacket = routePreviewPacket();
+  if (mapPacket) await writeBle(mapPacket);
+
+  // Re-route if we are clearly away from the route / maneuver path.
+  if (dist > 250 && Date.now() - lastRouteRequest > 15000) {
+    await calculateRoute();
+  }
+}
+
+startGps();
+</script>
+</body>
+</html>
