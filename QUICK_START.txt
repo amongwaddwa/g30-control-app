@@ -1,0 +1,10 @@
+G30 CONTROL V2 ADVANCED - QUICK START
+
+1. Flasha firmware/SimpleVescDisplay_G30_UART_Throttle_V26_MOBILE_ADVANCED_APP.ino
+2. Arduino: välj Huge APP / 3 MB APP om sketchen inte får plats.
+3. Bygg Android-APK med GitHub Actions (Build G30 Control APK).
+4. Installera app-debug.apk.
+5. Anslut till G30-NAV.
+6. Stå helt still och släpp gasen innan Apply/Save.
+7. Advanced VESC: ENDAST reglage du själv flyttar skickas till VESC.
+8. Spara permanent avslutar med conf-store och ESP32-restart.
